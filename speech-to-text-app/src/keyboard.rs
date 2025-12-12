@@ -24,14 +24,31 @@ fn normalize_text(text: &str) -> String {
 }
 
 /// Type out text character by character using simulated keyboard input
-pub fn type_text(text: &str) {
+/// Returns the number of characters actually typed
+pub fn type_text(text: &str) -> usize {
     let normalized = normalize_text(text);
+    let mut count = 0;
     for c in normalized.chars() {
         if let Some((key, needs_shift)) = char_to_key(c) {
             send_key(key, needs_shift);
+            count += 1;
         }
         // Silently skip unsupported characters
     }
+    count
+}
+
+/// Delete characters by sending backspace keys
+pub fn delete_chars(count: usize) {
+    // Small pause before starting deletion to ensure typing has stopped
+    thread::sleep(time::Duration::from_millis(50));
+    for _ in 0..count {
+        let _ = simulate(&EventType::KeyPress(Key::Backspace));
+        let _ = simulate(&EventType::KeyRelease(Key::Backspace));
+        thread::sleep(time::Duration::from_millis(10));
+    }
+    // Small pause after deletion before typing new text
+    thread::sleep(time::Duration::from_millis(50));
 }
 
 fn send_key(key: Key, shift: bool) {

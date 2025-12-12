@@ -1,5 +1,6 @@
 mod audio;
 mod keyboard;
+mod overlay;
 mod tray;
 
 use anyhow::Result;
@@ -7,7 +8,6 @@ use clap::Parser;
 use muda::MenuEvent;
 use rdev::{listen, Button, EventType};
 use sherpa_rs::nemo_ctc::{NemoCtcConfig, NemoCtcRecognizer};
-use sherpa_rs::punctuate::{Punctuation, PunctuationConfig};
 use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
@@ -54,14 +54,6 @@ struct Args {
     /// Path to the Silero VAD model file
     #[arg(long, default_value = "models/silero_vad.onnx")]
     vad_model: String,
-
-    /// Enable automatic punctuation
-    #[arg(long)]
-    punctuate: bool,
-
-    /// Path to the punctuation model directory
-    #[arg(long, default_value = "models/punct-ct-transformer/model.onnx")]
-    punct_model: String,
 }
 
 /// Recording state
@@ -140,38 +132,13 @@ fn main() -> Result<()> {
     ));
     println!("✅ VAD loaded successfully!");
 
-    // Initialize punctuation if enabled
-    let punctuator = if args.punctuate {
-        if std::path::Path::new(&args.punct_model).exists() {
-            let punct_config = PunctuationConfig {
-                model: args.punct_model.clone(),
-                ..Default::default()
-            };
-            match Punctuation::new(punct_config) {
-                Ok(p) => {
-                    println!("✅ Punctuation loaded successfully!");
-                    Some(Arc::new(Mutex::new(p)))
-                }
-                Err(e) => {
-                    eprintln!("Failed to load punctuation model: {:?}", e);
-                    None
-                }
-            }
-        } else {
-            eprintln!("Punctuation model not found at '{}'. Run .\\download_model.ps1 to download.", args.punct_model);
-            None
-        }
-    } else {
-        None
-    };
+    // Initialize overlay controller for live transcription preview
+    let overlay = Arc::new(overlay::OverlayController::new());
 
     println!();
     println!("Controls:");
     println!("  Mouse Button {} (side): Streaming mode - Live transcription", args.streaming_btn);
     println!("  Mouse Button {} (side): Batch mode - Press to start, press again to transcribe", args.batch_btn);
-    if punctuator.is_some() {
-        println!("  Auto-punctuation: ENABLED");
-    }
     println!();
     println!("Waiting for input...");
 
@@ -183,13 +150,19 @@ fn main() -> Result<()> {
     
     // Audio buffer for batch mode
     let audio_buffer = Arc::new(Mutex::new(Vec::new()));
+    
+    // Audio buffer for streaming mode (accumulate ALL audio for final re-transcription)
+    let streaming_audio_buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+    
+    // Accumulated text for overlay display
+    let streaming_text_display = Arc::new(Mutex::new(String::new()));
 
     // Clone for audio thread
     let recording_state_audio = recording_state.clone();
     let audio_buffer_clone = audio_buffer.clone();
     let recognizer_streaming = recognizer.clone();
     let vad_streaming = vad.clone();
-    let punctuator_streaming = punctuator.clone();
+    let streaming_audio_clone = streaming_audio_buffer.clone();
     
     // Channel to send transcribed text for typing (streaming mode)
     let (text_tx, text_rx) = mpsc::channel::<String>();
@@ -214,7 +187,12 @@ fn main() -> Result<()> {
                     buffer.extend_from_slice(&samples);
                 }
                 RecordingState::StreamingRecording => {
-                    // Use VAD to detect speech segments
+                    // Accumulate ALL audio for final re-transcription
+                    if let Ok(mut buf) = streaming_audio_clone.lock() {
+                        buf.extend_from_slice(&samples);
+                    }
+                    
+                    // Use VAD to detect speech segments for live preview
                     if let Ok(mut vad) = vad_streaming.lock() {
                         vad.accept_waveform(samples.clone());
                         
@@ -223,18 +201,11 @@ fn main() -> Result<()> {
                             let segment = vad.front();
                             vad.pop();
                             
-                            // Transcribe the speech segment
+                            // Transcribe the speech segment (raw, no punctuation)
                             if !segment.samples.is_empty() {
                                 if let Ok(mut rec) = recognizer_streaming.lock() {
                                     let result = rec.transcribe(16000, &segment.samples);
-                                    let mut text = result.text.trim().to_string();
-                                    
-                                    // Apply punctuation if enabled
-                                    if let Some(ref punct) = punctuator_streaming {
-                                        if let Ok(mut p) = punct.lock() {
-                                            text = p.add_punctuation(&text);
-                                        }
-                                    }
+                                    let text = result.text.trim().to_string();
                                     
                                     if !text.is_empty() {
                                         println!("🎤 {}", text);
@@ -256,13 +227,15 @@ fn main() -> Result<()> {
     let recording_state_main = recording_state.clone();
     let audio_buffer_main = audio_buffer.clone();
     let vad_main = vad.clone();
-    let punctuator_main = punctuator.clone();
+    let streaming_audio_main = streaming_audio_buffer.clone();
+    let overlay_main = overlay.clone();
 
-    // Thread to type transcribed text from streaming mode
+    // Thread to update overlay with transcribed text (streaming mode)
+    let overlay_typing = overlay.clone();
     thread::spawn(move || {
         for text in text_rx {
-            keyboard::type_text(&text);
-            keyboard::type_text(" "); // Add space between chunks
+            // Append text to overlay display
+            overlay_typing.append_text(&text);
         }
     });
 
@@ -314,18 +287,11 @@ fn main() -> Result<()> {
                             } else {
                                 if let Ok(mut rec) = recognizer_main.lock() {
                                     let result = rec.transcribe(16000, &samples);
-                                    let mut text = result.text.trim().to_string();
-                                    
-                                    // Apply punctuation if enabled
-                                    if let Some(ref punct) = punctuator_main {
-                                        if let Ok(mut p) = punct.lock() {
-                                            text = p.add_punctuation(&text);
-                                        }
-                                    }
+                                    let text = result.text.trim();
                                     
                                     println!("✅ Transcription: {}", text);
                                     if !text.is_empty() {
-                                        keyboard::type_text(&text);
+                                        keyboard::type_text(text);
                                     }
                                 }
                             }
@@ -340,19 +306,58 @@ fn main() -> Result<()> {
                     match current_state {
                         RecordingState::Idle => {
                             println!("\n🎤 Streaming mode started... (press Button {} again to stop)", streaming_btn);
-                            // Clear VAD state for fresh start
+                            // Clear VAD and audio buffer
                             if let Ok(mut v) = vad_main.lock() {
                                 v.clear();
                             }
+                            if let Ok(mut buf) = streaming_audio_main.lock() {
+                                buf.clear();
+                            }
+                            // Show overlay
+                            overlay_main.show();
                             recording_state_main.store(RecordingState::StreamingRecording as u8, Ordering::Relaxed);
                         }
                         RecordingState::StreamingRecording => {
                             println!("\n⏹️ Stopping streaming...");
                             recording_state_main.store(RecordingState::Idle as u8, Ordering::Relaxed);
+                            
+                            // Hide overlay
+                            overlay_main.hide();
+                            
                             // Flush VAD to get any remaining speech
                             if let Ok(mut v) = vad_main.lock() {
                                 v.flush();
                             }
+                            // Wait for last transcriptions to come through
+                            thread::sleep(Duration::from_millis(400));
+                            
+                            // Get the accumulated audio
+                            let audio_samples = {
+                                let buf = streaming_audio_main.lock().unwrap();
+                                buf.clone()
+                            };
+                            
+                            if !audio_samples.is_empty() {
+                                println!("📝 Re-transcribing {} samples for proper punctuation...", audio_samples.len());
+                                
+                                // Re-transcribe ALL audio at once (gives Parakeet full context)
+                                if let Ok(mut rec) = recognizer_main.lock() {
+                                    let result = rec.transcribe(16000, &audio_samples);
+                                    let final_text = result.text.trim();
+                                    
+                                    if !final_text.is_empty() {
+                                        println!("✨ Final: {}", final_text);
+                                        // Type the final, properly punctuated text
+                                        keyboard::type_text(final_text);
+                                    }
+                                }
+                            }
+                            
+                            // Clear audio buffer
+                            if let Ok(mut buf) = streaming_audio_main.lock() {
+                                buf.clear();
+                            }
+                            
                             println!("✅ Streaming complete");
                         }
                         RecordingState::BatchRecording => {

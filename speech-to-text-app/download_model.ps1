@@ -86,13 +86,13 @@ if (-not (Test-Path $vadDest)) {
     Write-Host "VAD model already exists."
 }
 
-# Download Punctuation model
-$punctUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12.tar.bz2"
-$punctDest = "$modelsDir\punct-ct-transformer"
-$punctModel = "$punctDest\model.onnx"
+# Download Punctuation model (CT-Transformer int8, zh-en, 62MB)
+$punctUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2"
+$punctDest = "$modelsDir\punct"
+$punctModel = "$punctDest\model.int8.onnx"
 
 if (-not (Test-Path $punctModel)) {
-    Write-Host "Downloading Punctuation model..."
+    Write-Host "Downloading Punctuation model (English, 7MB)..."
     try {
         $curlPath = (Get-Command curl.exe -ErrorAction SilentlyContinue)
         if ($curlPath) {
@@ -104,7 +104,7 @@ if (-not (Test-Path $punctModel)) {
         tar -xf "punct.tar.bz2"
         Pop-Location
         if (Test-Path "$modelsDir\sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12") {
-            Rename-Item "$modelsDir\sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12" $punctDest -Force
+            Move-Item "$modelsDir\sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12" $punctDest -Force
         }
         Remove-Item "$modelsDir\punct.tar.bz2" -Force -ErrorAction SilentlyContinue
         Write-Host "  ✓ Punctuation model downloaded"
@@ -117,14 +117,14 @@ if (-not (Test-Path $punctModel)) {
 
 Write-Host ""
 Write-Host "Model files are in: $modelsDir\"
-Write-Host "  - model.int8.onnx (ASR)"
+Write-Host "  - model.int8.onnx (ASR, 132MB)"
 Write-Host "  - tokens.txt"
-Write-Host "  - silero_vad.onnx (VAD)"
-Write-Host "  - punct-ct-transformer/model.onnx (Punctuation)"
+Write-Host "  - silero_vad.onnx (VAD, 0.6MB)"
+Write-Host "  - punct/model.onnx (Punctuation)"
 Write-Host ""
-Write-Host "You can now run the app with:"
+Write-Host "Run the app:"
 Write-Host "  cargo run --release"
 Write-Host ""
-Write-Host "To enable auto-punctuation:"
+Write-Host "With auto-punctuation:"
 Write-Host "  cargo run --release -- --punctuate"
 Write-Host ""
