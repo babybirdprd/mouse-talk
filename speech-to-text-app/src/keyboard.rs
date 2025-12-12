@@ -1,15 +1,36 @@
 use rdev::{simulate, EventType, Key};
 use std::{thread, time};
 
+/// Normalize unicode punctuation to ASCII equivalents
+fn normalize_text(text: &str) -> String {
+    text.chars().map(|c| match c {
+        // Chinese punctuation to English
+        '，' => ',',
+        '。' => '.',
+        '？' => '?',
+        '！' => '!',
+        '：' => ':',
+        '；' => ';',
+        '"' | '"' | '「' | '」' => '"',
+        '\u{2018}' | '\u{2019}' => '\'',
+        '（' => '(',
+        '）' => ')',
+        '【' => '[',
+        '】' => ']',
+        '—' | '–' => '-',
+        '…' => '.',
+        _ => c,
+    }).collect()
+}
+
 /// Type out text character by character using simulated keyboard input
 pub fn type_text(text: &str) {
-    for c in text.chars() {
+    let normalized = normalize_text(text);
+    for c in normalized.chars() {
         if let Some((key, needs_shift)) = char_to_key(c) {
             send_key(key, needs_shift);
-        } else {
-            // For unsupported characters, just skip with a warning
-            eprintln!("⚠️ Cannot type char: '{}' (0x{:04x})", c, c as u32);
         }
+        // Silently skip unsupported characters
     }
 }
 

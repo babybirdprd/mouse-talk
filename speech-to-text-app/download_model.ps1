@@ -64,10 +64,67 @@ Write-Host "=========================================="
 Write-Host "Model downloaded successfully!"
 Write-Host "=========================================="
 Write-Host ""
+
+# Download VAD model
+$vadUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+$vadDest = "$modelsDir\silero_vad.onnx"
+
+if (-not (Test-Path $vadDest)) {
+    Write-Host "Downloading Silero VAD model..."
+    try {
+        $curlPath = (Get-Command curl.exe -ErrorAction SilentlyContinue)
+        if ($curlPath) {
+            & curl.exe -L -o $vadDest $vadUrl --progress-bar
+        } else {
+            Invoke-WebRequest -Uri $vadUrl -OutFile $vadDest -UseBasicParsing
+        }
+        Write-Host "  ✓ VAD model downloaded"
+    } catch {
+        Write-Host "  ✗ Failed to download VAD model: $_"
+    }
+} else {
+    Write-Host "VAD model already exists."
+}
+
+# Download Punctuation model
+$punctUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12.tar.bz2"
+$punctDest = "$modelsDir\punct-ct-transformer"
+$punctModel = "$punctDest\model.onnx"
+
+if (-not (Test-Path $punctModel)) {
+    Write-Host "Downloading Punctuation model..."
+    try {
+        $curlPath = (Get-Command curl.exe -ErrorAction SilentlyContinue)
+        if ($curlPath) {
+            & curl.exe -L -o "$modelsDir\punct.tar.bz2" $punctUrl --progress-bar
+        } else {
+            Invoke-WebRequest -Uri $punctUrl -OutFile "$modelsDir\punct.tar.bz2" -UseBasicParsing
+        }
+        Push-Location $modelsDir
+        tar -xf "punct.tar.bz2"
+        Pop-Location
+        if (Test-Path "$modelsDir\sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12") {
+            Rename-Item "$modelsDir\sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12" $punctDest -Force
+        }
+        Remove-Item "$modelsDir\punct.tar.bz2" -Force -ErrorAction SilentlyContinue
+        Write-Host "  ✓ Punctuation model downloaded"
+    } catch {
+        Write-Host "  ✗ Failed to download punctuation model: $_"
+    }
+} else {
+    Write-Host "Punctuation model already exists."
+}
+
+Write-Host ""
 Write-Host "Model files are in: $modelsDir\"
-Write-Host "  - model.int8.onnx"
+Write-Host "  - model.int8.onnx (ASR)"
 Write-Host "  - tokens.txt"
+Write-Host "  - silero_vad.onnx (VAD)"
+Write-Host "  - punct-ct-transformer/model.onnx (Punctuation)"
 Write-Host ""
 Write-Host "You can now run the app with:"
 Write-Host "  cargo run --release"
+Write-Host ""
+Write-Host "To enable auto-punctuation:"
+Write-Host "  cargo run --release -- --punctuate"
 Write-Host ""

@@ -10,3 +10,8 @@ cpal = "0.16"
 rdev = "0.5"
 sherpa-rs = { path = "../sherpa-rs/crates/sherpa-rs", features = ["download-binaries"] }
 hound = "3.5"
+tray-icon = "0.19"
+muda = "0.15"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["wincon", "winuser"] }
