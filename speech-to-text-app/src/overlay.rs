@@ -14,9 +14,11 @@ use std::ptr;
 use winapi::um::winuser::*;
 use winapi::um::wingdi::*;
 use winapi::um::dwmapi::*;
+use winapi::um::uxtheme::MARGINS;
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::shared::windef::*;
 use winapi::shared::minwindef::*;
+use winapi::ctypes::c_void;
 
 const CLASS_NAME: &str = "MouseTalkOverlay";
 // Reduced header height since we removed the distinct bar, this is just top padding now
@@ -27,6 +29,9 @@ const MAX_HEIGHT: i32 = 600;
 
 // Transparent color key - this color will be fully transparent
 const TRANSPARENT_COLOR: u32 = 0x00FF00FF; // Magenta (RGB 255, 0, 255)
+
+// Windows 11+ attribute for non-client area color (not in winapi crate)
+const DWMWA_NCACTIVE_COLOR: u32 = 6;
 
 // Custom message for updating text
 const WM_UPDATE_TEXT: UINT = WM_USER + 1;
@@ -224,17 +229,18 @@ unsafe fn paint_window(hwnd: HWND, text: &str) {
     let mut rect: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut rect);
     
-    // Reference image has large rounded corners
-    let corner_radius = 24;
+    // Smoother rounded corners
+    let corner_radius = 32;
     
     // 1. Setup Transparency Key
     let trans_brush = CreateSolidBrush(TRANSPARENT_COLOR);
     FillRect(hdc, &rect, trans_brush);
     DeleteObject(trans_brush as *mut _);
     
-    // 3. Main background fill
-    // Purple-tinted frosted glass appearance (fully opaque)
-    let bg_color = RGB(45, 40, 65); 
+    // 3. Main background fill - solid dark for readability
+    // 3. Main background fill - solid dark for readability
+    // Deep Slate: Neutral, easier on eyes, but high enough values to maintain opacity in Glass
+    let bg_color = RGB(20, 20, 30);
     let bg_brush = CreateSolidBrush(bg_color);
     let rounded_region = CreateRoundRectRgn(0, 0, rect.right + 1, rect.bottom + 1, corner_radius, corner_radius);
     
@@ -243,8 +249,8 @@ unsafe fn paint_window(hwnd: HWND, text: &str) {
     DeleteObject(bg_brush as *mut _);
 
     // 4. Border
-    // Subtle border
-    let border_pen = CreatePen(PS_SOLID as i32, 1, RGB(80, 70, 100));
+    // Subtle blue-tinted border
+    let border_pen = CreatePen(PS_SOLID as i32, 1, RGB(70, 80, 110));
     let null_brush = GetStockObject(NULL_BRUSH as i32);
     SelectObject(hdc, border_pen as *mut _);
     SelectObject(hdc, null_brush);
@@ -351,21 +357,42 @@ unsafe fn run_overlay(state: Arc<Mutex<OverlayState>>, is_running: Arc<AtomicBoo
         return;
     }
     
-    // Use color key to make corners transparent, alpha 255 = fully opaque
-    // Only the magenta color key will be transparent (for rounded corners)
-    SetLayeredWindowAttributes(hwnd, TRANSPARENT_COLOR, 255, LWA_COLORKEY | LWA_ALPHA);
+const WINDOW_ALPHA: BYTE = 180; // or 200 (approx 78%) or 220 (approx 86%)
+SetLayeredWindowAttributes(hwnd, TRANSPARENT_COLOR, WINDOW_ALPHA, LWA_COLORKEY | LWA_ALPHA);
     
     // Enable DWM blur behind window for glassmorphic effect
     let mut blur_behind: DWM_BLURBEHIND = std::mem::zeroed();
     blur_behind.dwFlags = DWM_BB_ENABLE | DWM_BB_BLURREGION;
     blur_behind.fEnable = 1; // TRUE
     // Create a rounded region for blur
-    blur_behind.hRgnBlur = CreateRoundRectRgn(0, 0, WIDTH + 1, MAX_HEIGHT + 1, 16, 16);
+    // Match the corner radius from paint_window (32)
+    blur_behind.hRgnBlur = CreateRoundRectRgn(0, 0, WIDTH + 1, MAX_HEIGHT + 1, 32, 32);
     DwmEnableBlurBehindWindow(hwnd, &blur_behind);
     // Clean up the region (DWM makes a copy)
     if !blur_behind.hRgnBlur.is_null() {
         DeleteObject(blur_behind.hRgnBlur as *mut _);
     }
+    
+    // Set the Frame Color and Opacity (Windows 11+)
+    // ARGB format: AARRGGBB. 0xDC (220/255) is ~85% opacity, with dark color (20, 20, 30).
+    const OPAQUE_FRAME_COLOR: u32 = 0xDC14141E;
+    
+    // Extend the frame to cover the entire client area
+    let margins = MARGINS {
+        cxLeftWidth: -1, // -1 extends to entire window
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
+    };
+    DwmExtendFrameIntoClientArea(hwnd, &margins);
+    
+    // Set the color and alpha for the extended frame (Windows 11+, fallback gracefully)
+    DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_NCACTIVE_COLOR,
+        &OPAQUE_FRAME_COLOR as *const u32 as *const c_void,
+        std::mem::size_of::<u32>() as u32,
+    );
     
     // Store state pointer
     let state_ptr = Arc::into_raw(state.clone());
