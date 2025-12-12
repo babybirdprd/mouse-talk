@@ -1,5 +1,6 @@
 use rdev::{simulate, EventType, Key};
 use std::{thread, time};
+use clipboard_win::{formats, set_clipboard};
 
 /// Normalize unicode punctuation to ASCII equivalents
 fn normalize_text(text: &str) -> String {
@@ -23,8 +24,37 @@ fn normalize_text(text: &str) -> String {
     }).collect()
 }
 
+/// Paste text using clipboard (faster and more reliable than typing)
+/// Returns true if successful
+pub fn paste_text(text: &str) -> bool {
+    let normalized = normalize_text(text);
+    
+    // Set clipboard content
+    if set_clipboard(formats::Unicode, &normalized).is_err() {
+        eprintln!("Failed to set clipboard");
+        return false;
+    }
+    
+    // Small delay to ensure clipboard is set
+    thread::sleep(time::Duration::from_millis(50));
+    
+    // Send Ctrl+V to paste
+    let _ = simulate(&EventType::KeyPress(Key::ControlLeft));
+    thread::sleep(time::Duration::from_millis(10));
+    let _ = simulate(&EventType::KeyPress(Key::KeyV));
+    let _ = simulate(&EventType::KeyRelease(Key::KeyV));
+    thread::sleep(time::Duration::from_millis(10));
+    let _ = simulate(&EventType::KeyRelease(Key::ControlLeft));
+    
+    // Small delay after paste
+    thread::sleep(time::Duration::from_millis(50));
+    
+    true
+}
+
 /// Type out text character by character using simulated keyboard input
 /// Returns the number of characters actually typed
+/// NOTE: paste_text() is preferred - this is kept as fallback
 pub fn type_text(text: &str) -> usize {
     let normalized = normalize_text(text);
     let mut count = 0;

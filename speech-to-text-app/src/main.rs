@@ -291,7 +291,7 @@ fn main() -> Result<()> {
                                     
                                     println!("✅ Transcription: {}", text);
                                     if !text.is_empty() {
-                                        keyboard::type_text(text);
+                                        keyboard::paste_text(text);
                                     }
                                 }
                             }
@@ -348,7 +348,7 @@ fn main() -> Result<()> {
                                     if !final_text.is_empty() {
                                         println!("✨ Final: {}", final_text);
                                         // Type the final, properly punctuated text
-                                        keyboard::type_text(final_text);
+                                        keyboard::paste_text(final_text);
                                     }
                                 }
                             }
