@@ -1,6 +1,9 @@
+#![windows_subsystem = "windows"]
+
 mod audio;
 mod keyboard;
 mod overlay;
+mod notification;
 mod tray;
 
 use anyhow::Result;
@@ -78,10 +81,15 @@ impl From<u8> for RecordingState {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Hide console unless --show-console is specified
-    if !args.show_console {
-        tray::hide_console_window();
+    // If --show-console is specified, allocate a console
+    if args.show_console {
+        #[cfg(windows)]
+        unsafe {
+            use winapi::um::consoleapi::AllocConsole;
+            AllocConsole();
+        }
     }
+    // Otherwise, we default to no console (windows subsystem), so no hiding needed.
 
     // Initialize system tray
     let tray_app = tray::TrayApp::new()?;
@@ -150,6 +158,9 @@ fn main() -> Result<()> {
 
     // Initialize overlay controller for live transcription preview
     let overlay = Arc::new(overlay::OverlayController::new());
+    
+    // Initialize notification controller for system messages (bottom right toast)
+    let notification = Arc::new(notification::NotificationController::new());
 
     println!();
     println!("Controls:");
@@ -247,6 +258,7 @@ fn main() -> Result<()> {
     let vad_main = vad.clone();
     let streaming_audio_main = streaming_audio_buffer.clone();
     let overlay_main = overlay.clone();
+    let notification_main = notification.clone();
 
     // Thread to update overlay with transcribed text (streaming mode)
     let overlay_typing = overlay.clone();
@@ -294,31 +306,20 @@ fn main() -> Result<()> {
                         *rec_guard = None;
                         println!("📦 Models unloaded");
                         
-                        overlay_main.show();
-                        overlay_main.set_text("Models Unloaded");
-                        thread::spawn({
-                            let ov = overlay_main.clone();
-                            move || {
-                                thread::sleep(Duration::from_secs(1));
-                                ov.hide();
-                            }
-                        });
+                        notification_main.show("System", "Models Unloaded", 2000);
                     } else {
                         // Load
                         println!("⏳ Loading models...");
-                        overlay_main.show();
-                        overlay_main.set_text("Loading Models...");
+                        notification_main.show("System", "Loading Models...", 0); 
                         
                         let rec_clone = recognizer_main.clone();
-                        let ov = overlay_main.clone();
+                        let notif = notification_main.clone();
                         let m_path = model_path.clone();
                         let t_path = tokens_path.clone();
                         
                         thread::spawn(move || {
                              if !std::path::Path::new(&m_path).exists() {
-                                ov.set_text("Error: Model file not found");
-                                thread::sleep(Duration::from_secs(2));
-                                ov.hide();
+                                notif.show("Error", "Model file not found", 3000);
                                 return;
                             }
 
@@ -337,42 +338,30 @@ fn main() -> Result<()> {
                                         *g = Some(rec);
                                     }
                                     println!("✅ Models loaded!");
-                                    ov.set_text("Models Loaded");
-                                    thread::sleep(Duration::from_secs(1));
-                                    ov.hide();
+                                    notif.show("System", "Models Loaded", 2000);
                                 }
                                 Err(e) => {
                                     eprintln!("Failed to load: {}", e);
-                                    ov.set_text("Failed to load models");
-                                    thread::sleep(Duration::from_secs(2));
-                                    ov.hide();
+                                    notif.show("Error", "Failed to load models", 3000);
                                 }
                             }
                         });
                     }
                 } else if id == streaming_btn && streaming_enabled_input.load(Ordering::Relaxed) {
                     // Streaming Mode Logic
+                    let current_state = RecordingState::from(recording_state_main.load(Ordering::Relaxed));
                     
                     // Check if models are loaded checks
                     let models_loaded = {
                          recognizer_main.lock().unwrap().is_some()
                     };
-                    
-                    if !models_loaded {
-                        println!("⚠️ Models not loaded. Press Button {} to load.", model_btn);
-                        overlay_main.show();
-                        overlay_main.set_text("Models Not Loaded!");
-                        thread::spawn({
-                            let ov = overlay_main.clone();
-                            move || {
-                                thread::sleep(Duration::from_secs(1));
-                                ov.hide();
-                            }
-                        });
-                    } else {
-                        let current_state = RecordingState::from(recording_state_main.load(Ordering::Relaxed));
-                        match current_state {
-                            RecordingState::Idle => {
+
+                    match current_state {
+                        RecordingState::Idle => {
+                            if !models_loaded {
+                                println!("⚠️ Models not loaded. Press Button {} to load.", model_btn);
+                                notification_main.show("Warning", "Models not loaded.\nCheck Side Button.", 3000);
+                            } else {
                                 println!("\n🎤 Streaming mode started... (press Button {} again to stop)", streaming_btn);
                                 // Clear VAD and audio buffer
                                 if let Ok(mut v) = vad_main.lock() {
@@ -386,53 +375,56 @@ fn main() -> Result<()> {
                                 overlay_main.set_text("Listening..."); // Reset text
                                 recording_state_main.store(RecordingState::StreamingRecording as u8, Ordering::Relaxed);
                             }
-                            RecordingState::StreamingRecording => {
-                                println!("\n⏹️ Stopping streaming...");
-                                recording_state_main.store(RecordingState::Idle as u8, Ordering::Relaxed);
+                        }
+                        RecordingState::StreamingRecording => {
+                            println!("\n⏹️ Stopping streaming...");
+                            recording_state_main.store(RecordingState::Idle as u8, Ordering::Relaxed);
+                            
+                            // Hide overlay
+                            overlay_main.hide();
+                            
+                            // Flush VAD to get any remaining speech
+                            if let Ok(mut v) = vad_main.lock() {
+                                v.flush();
+                            }
+                            // Wait for last transcriptions to come through
+                            thread::sleep(Duration::from_millis(400));
+                            
+                            // Get the accumulated audio
+                            let audio_samples = {
+                                let buf = streaming_audio_main.lock().unwrap();
+                                buf.clone()
+                            };
+                            
+                            if !audio_samples.is_empty() {
+                                println!("📝 Re-transcribing {} samples for proper punctuation...", audio_samples.len());
                                 
-                                // Hide overlay
-                                overlay_main.hide();
-                                
-                                // Flush VAD to get any remaining speech
-                                if let Ok(mut v) = vad_main.lock() {
-                                    v.flush();
-                                }
-                                // Wait for last transcriptions to come through
-                                thread::sleep(Duration::from_millis(400));
-                                
-                                // Get the accumulated audio
-                                let audio_samples = {
-                                    let buf = streaming_audio_main.lock().unwrap();
-                                    buf.clone()
-                                };
-                                
-                                if !audio_samples.is_empty() {
-                                    println!("📝 Re-transcribing {} samples for proper punctuation...", audio_samples.len());
-                                    
-                                    // Re-transcribe ALL audio at once
-                                    if let Ok(mut rec_opt) = recognizer_main.lock() {
-                                        if let Some(rec) = rec_opt.as_mut() {
-                                            let result = rec.transcribe(16000, &audio_samples);
-                                            let final_text = result.text.trim();
-                                            
-                                            if !final_text.is_empty() {
-                                                println!("✨ Final: {}", final_text);
-                                                // Type the final, properly punctuated text
-                                                keyboard::paste_text(final_text);
-                                            }
+                                // Re-transcribe ALL audio at once
+                                if let Ok(mut rec_opt) = recognizer_main.lock() {
+                                    if let Some(rec) = rec_opt.as_mut() {
+                                        let result = rec.transcribe(16000, &audio_samples);
+                                        let final_text = result.text.trim();
+                                        
+                                        if !final_text.is_empty() {
+                                            println!("✨ Final: {}", final_text);
+                                            // Type the final, properly punctuated text
+                                            keyboard::paste_text(final_text);
                                         }
+                                    } else {
+                                        println!("⚠️ Models unloaded before final transcription could complete.");
+                                        notification_main.show("Error", "Models unloaded.\nCannot finalize text.", 3000);
                                     }
                                 }
-                                
-                                // Clear audio buffer
-                                if let Ok(mut buf) = streaming_audio_main.lock() {
-                                    buf.clear();
-                                }
-                                
-                                println!("✅ Streaming complete");
                             }
-                             _ => {}
+                            
+                            // Clear audio buffer
+                            if let Ok(mut buf) = streaming_audio_main.lock() {
+                                buf.clear();
+                            }
+                            
+                            println!("✅ Streaming complete");
                         }
+                         _ => {}
                     }
                 } else {
                     // Debug print for other buttons

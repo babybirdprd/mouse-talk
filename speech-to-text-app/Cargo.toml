@@ -17,5 +17,5 @@ clipboard-win = "5.4"
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
     "wincon", "winuser", "wingdi", "libloaderapi", 
-    "errhandlingapi", "dwmapi", "uxtheme", "synchapi"
+    "errhandlingapi", "dwmapi", "uxtheme", "synchapi", "consoleapi"
 ] }
