@@ -78,14 +78,35 @@ while (i as usize) < mono_data.len() {
 *   **Impact**: This introduces severe aliasing artifacts, making the audio sound "crunchy" or metallic to the model. This significantly degrades Speech-to-Text (STT) accuracy, especially in noisy environments or with high-pitched voices.
 *   **Recommendation**: Use a proper resampling library like `rubato` or `samplerate` that implements a low-pass filter before downsampling.
 
-## 5. Code Quality & Structure
+## 5. Parallelism & Rayon
+
+An evaluation was performed on integrating `rayon` for data parallelism.
+
+### Current State
+*   **Audio Processing**: Sequential. Sample conversion and "resampling" happen on the audio thread.
+*   **Inference**: `sherpa-onnx` internally manages threading via ONNX Runtime (controlled by `num_threads` arg).
+*   **VAD**: Runs sequentially on the audio thread.
+
+### Potential Benefits of Rayon
+1.  **Batch Processing**: In "Batch Mode" (Button 5), if the user records a very long session, the post-processing (normalization, potential re-scoring) could be parallelized.
+2.  **Audio Conversion**: If high-quality resampling is implemented (e.g., Sinc interpolation), processing large buffers in chunks could benefit from parallel iterators (`par_iter`).
+
+### Challenges
+*   **Real-time Constraints**: For the *streaming* mode, the chunks are typically small (milliseconds). The overhead of spinning up Rayon tasks for such small data would likely exceed the benefits, potentially increasing latency.
+*   **Model Threading Conflict**: `sherpa-onnx` already saturates CPU cores during inference. Adding Rayon for data processing while the model is running could lead to thread contention and context switching overhead.
+
+### Recommendation
+*   **Do not use Rayon for the real-time streaming loop.** The overhead is unjustified for small audio chunks.
+*   **Consider Rayon for offline/batch tasks** only if significant post-processing is added (e.g., batch resampling of a 1-hour recording, or searching through history). For the current scope, standard threads or async tasks are sufficient.
+
+## 6. Code Quality & Structure
 
 *   **Monolithic `main.rs`**: The main file handles CLI parsing, tray management, model loading, application state, and input event logic. This makes it hard to test and maintain.
 *   **Platform Coupling**: `overlay.rs` and parts of `keyboard.rs` use raw `winapi` calls. This makes porting to Linux/macOS difficult.
 *   **Hardcoded Configuration**: Model paths, button IDs (mapped to generic "Side Button"), and audio parameters are either hardcoded or mixed with CLI args. A centralized `Config` struct would be better.
 *   **Error Handling**: There are several `unwrap()` calls on Mutexes. If a thread panics while holding a lock, the entire application will crash on the next access (poisoned mutex).
 
-## 6. Recommendations
+## 7. Recommendations
 
 ### Immediate Fixes
 1.  **Offload Final Transcription**: Move the final transcription logic out of the `rdev` callback. Use a channel to signal a worker thread to perform the transcription and paste operation.
