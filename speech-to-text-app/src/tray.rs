@@ -41,7 +41,7 @@ impl TrayApp {
         );
         let batch_item = CheckMenuItem::with_id(
             MenuId::new(MENU_BATCH_TOGGLE),
-            "Batch Mode",
+            "Enable Model Button",
             true,
             true,
             None,
@@ -91,7 +91,7 @@ impl TrayApp {
                 let current = self.batch_enabled.load(Ordering::Relaxed);
                 self.batch_enabled.store(!current, Ordering::Relaxed);
                 self.batch_menu_item.set_checked(!current);
-                println!("📝 Batch mode: {}", if !current { "enabled" } else { "disabled" });
+                println!("🔘 Model button: {}", if !current { "enabled" } else { "disabled" });
                 false
             }
             MENU_QUIT => {

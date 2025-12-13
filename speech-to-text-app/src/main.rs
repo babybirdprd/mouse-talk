@@ -43,9 +43,9 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     streaming_btn: u8,
 
-    /// Mouse button ID for batch mode (Default: 1 - Side Button)
+    /// Mouse button ID for model loading toggle (Default: 1 - Side Button)
     #[arg(long, default_value_t = 1)]
-    batch_btn: u8,
+    model_btn: u8,
 
     /// Show console window instead of running in background
     #[arg(long)]
@@ -88,37 +88,53 @@ fn main() -> Result<()> {
     let streaming_enabled = tray_app.streaming_enabled.clone();
     let batch_enabled = tray_app.batch_enabled.clone();
 
-    // Check model files exist
-    if !std::path::Path::new(&args.model).exists() {
-        eprintln!("Error: Model file '{}' not found.", args.model);
-        eprintln!("Download the Parakeet TDT-CTC 110M model:");
-        eprintln!("  .\\download_model.ps1");
-        return Err(anyhow::anyhow!("Model file not found"));
-    }
-
-    if !std::path::Path::new(&args.tokens).exists() {
-        eprintln!("Error: Tokens file '{}' not found.", args.tokens);
-        return Err(anyhow::anyhow!("Tokens file not found"));
-    }
-
-    println!("Loading NeMo CTC model...");
-    let config = NemoCtcConfig {
-        model: args.model,
-        tokens: args.tokens,
-        num_threads: Some(args.num_threads),
-        debug: args.debug,
-        ..Default::default()
+    // Resolve paths relative to executable location if not found in current dir
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_default();
+    
+    let resolve_path = |path: &str| -> std::path::PathBuf {
+        let p = std::path::Path::new(path);
+        if p.exists() {
+            return p.to_path_buf();
+        }
+        // Try next to executable
+        let p_exe = exe_dir.join(path);
+        if p_exe.exists() {
+            return p_exe;
+        }
+        // Try up one level (useful for target/release/ usage)
+        let p_up = exe_dir.join("..").join(path);
+        if p_up.exists() {
+            return p_up;
+        }
+        // Try up two levels (standard cargo run --release structure: target/release/ -> root)
+        let p_up2 = exe_dir.join("../..").join(path);
+        if p_up2.exists() {
+            return p_up2;
+        }
+        // Return original to let it fail naturally or use as fallback
+        p.to_path_buf()
     };
 
-    let recognizer = Arc::new(Mutex::new(
-        NemoCtcRecognizer::new(config).map_err(|e| anyhow::anyhow!("{:?}", e))?
-    ));
+    let model_path = resolve_path(&args.model);
+    let tokens_path = resolve_path(&args.tokens);
+    let vad_path = resolve_path(&args.vad_model);
 
-    println!("✅ Model loaded successfully!");
+    // Initial check unnecessary for lazy loaded main model, but critical for VAD
+    // We won't block main model, but we will warn if VAD is missing since it loads immediately
+    if !vad_path.exists() {
+        let msg = format!("VAD Model not found at: {}\nPlease check your models folder.", vad_path.display());
+        show_error_box("Missing VAD Model", &msg);
+        return Err(anyhow::anyhow!("VAD model not found"));
+    }
+
+    // Initialize recognizer container (empty at start)
+    let recognizer: Arc<Mutex<Option<NemoCtcRecognizer>>> = Arc::new(Mutex::new(None));
+
+    println!("ℹ️ Application started. Press Button {} to load models.", args.model_btn);
 
     // Initialize VAD for streaming mode
     let vad_config = SileroVadConfig {
-        model: args.vad_model.clone(),
+        model: vad_path.to_string_lossy().to_string(),
         min_silence_duration: 0.5, // Wait 0.5s of silence before ending phrase
         min_speech_duration: 0.25, // Minimum speech to trigger
         max_speech_duration: 30.0, // Allow long speech segments
@@ -138,7 +154,7 @@ fn main() -> Result<()> {
     println!();
     println!("Controls:");
     println!("  Mouse Button {} (side): Streaming mode - Live transcription", args.streaming_btn);
-    println!("  Mouse Button {} (side): Batch mode - Press to start, press again to transcribe", args.batch_btn);
+    println!("  Mouse Button {} (side): Toggle Models - Load/Unload ASR models", args.model_btn);
     println!();
     println!("Waiting for input...");
 
@@ -203,13 +219,15 @@ fn main() -> Result<()> {
                             
                             // Transcribe the speech segment (raw, no punctuation)
                             if !segment.samples.is_empty() {
-                                if let Ok(mut rec) = recognizer_streaming.lock() {
-                                    let result = rec.transcribe(16000, &segment.samples);
-                                    let text = result.text.trim().to_string();
-                                    
-                                    if !text.is_empty() {
-                                        println!("🎤 {}", text);
-                                        let _ = text_tx.send(text);
+                                if let Ok(mut rec_opt) = recognizer_streaming.lock() {
+                                    if let Some(rec) = rec_opt.as_mut() {
+                                        let result = rec.transcribe(16000, &segment.samples);
+                                        let text = result.text.trim().to_string();
+                                        
+                                        if !text.is_empty() {
+                                            println!("🎤 {}", text);
+                                            let _ = text_tx.send(text);
+                                        }
                                     }
                                 }
                             }
@@ -240,12 +258,18 @@ fn main() -> Result<()> {
     });
 
     // Capture args for closure
-    let batch_btn = args.batch_btn;
+    let model_btn = args.model_btn;
     let streaming_btn = args.streaming_btn;
+    
+    // Capture config strings for loading thread (use resolved paths)
+    let model_path = model_path.to_string_lossy().to_string();
+    let tokens_path = tokens_path.to_string_lossy().to_string();
+    let num_threads = args.num_threads;
+    let debug_mode = args.debug;
 
     // Clone enabled flags for input handler
     let streaming_enabled_input = streaming_enabled.clone();
-    let batch_enabled_input = batch_enabled.clone();
+    let model_btn_enabled_input = batch_enabled.clone(); // Reusing batch toggle for model toggle
 
     // Start input listener in separate thread
     thread::spawn(move || {
@@ -255,121 +279,167 @@ fn main() -> Result<()> {
             // Normalize button to u8 if possible for comparison
             let btn_id = match button {
                 Button::Unknown(b) => Some(b),
-                Button::Left => None, // Ignore standard left click to distinguish from Unknown(1)
-                Button::Right => None, // Ignore standard right click to distinguish from Unknown(2)
+                Button::Left => None, 
+                Button::Right => None,
                 Button::Middle => Some(3),
             };
 
             if let Some(id) = btn_id {
-                if id == batch_btn && batch_enabled_input.load(Ordering::Relaxed) {
-                    // Batch Mode Logic
-                    let current_state = RecordingState::from(recording_state_main.load(Ordering::Relaxed));
-                    match current_state {
-                        RecordingState::Idle => {
-                            println!("\n🔴 Batch recording started... (press Button {} again to stop)", batch_btn);
-                            {
-                                let mut buffer = audio_buffer_main.lock().unwrap();
-                                buffer.clear();
+                if id == model_btn && model_btn_enabled_input.load(Ordering::Relaxed) {
+                    // Model Toggle Logic
+                    let mut rec_guard = recognizer_main.lock().unwrap();
+                    
+                    if rec_guard.is_some() {
+                        // Unload
+                        *rec_guard = None;
+                        println!("📦 Models unloaded");
+                        
+                        overlay_main.show();
+                        overlay_main.set_text("Models Unloaded");
+                        thread::spawn({
+                            let ov = overlay_main.clone();
+                            move || {
+                                thread::sleep(Duration::from_secs(1));
+                                ov.hide();
                             }
-                            recording_state_main.store(RecordingState::BatchRecording as u8, Ordering::Relaxed);
-                        }
-                        RecordingState::BatchRecording => {
-                            println!("\n⏹️ Stopping batch recording...");
-                            recording_state_main.store(RecordingState::Idle as u8, Ordering::Relaxed);
-                            thread::sleep(Duration::from_millis(100));
-                            let samples = {
-                                let buffer = audio_buffer_main.lock().unwrap();
-                                buffer.clone()
+                        });
+                    } else {
+                        // Load
+                        println!("⏳ Loading models...");
+                        overlay_main.show();
+                        overlay_main.set_text("Loading Models...");
+                        
+                        let rec_clone = recognizer_main.clone();
+                        let ov = overlay_main.clone();
+                        let m_path = model_path.clone();
+                        let t_path = tokens_path.clone();
+                        
+                        thread::spawn(move || {
+                             if !std::path::Path::new(&m_path).exists() {
+                                ov.set_text("Error: Model file not found");
+                                thread::sleep(Duration::from_secs(2));
+                                ov.hide();
+                                return;
+                            }
+
+                            let config = NemoCtcConfig {
+                                model: m_path,
+                                tokens: t_path,
+                                num_threads: Some(num_threads),
+                                debug: debug_mode,
+                                ..Default::default()
                             };
-                            println!("📝 Transcribing {} samples...", samples.len());
-                            if samples.is_empty() {
-                                println!("⚠️ No audio captured.");
-                            } else {
-                                if let Ok(mut rec) = recognizer_main.lock() {
-                                    let result = rec.transcribe(16000, &samples);
-                                    let text = result.text.trim();
-                                    
-                                    println!("✅ Transcription: {}", text);
-                                    if !text.is_empty() {
-                                        keyboard::paste_text(text);
+
+                            match NemoCtcRecognizer::new(config) {
+                                Ok(rec) => {
+                                    {
+                                        let mut g = rec_clone.lock().unwrap();
+                                        *g = Some(rec);
                                     }
+                                    println!("✅ Models loaded!");
+                                    ov.set_text("Models Loaded");
+                                    thread::sleep(Duration::from_secs(1));
+                                    ov.hide();
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to load: {}", e);
+                                    ov.set_text("Failed to load models");
+                                    thread::sleep(Duration::from_secs(2));
+                                    ov.hide();
                                 }
                             }
-                        }
-                        RecordingState::StreamingRecording => {
-                            println!("\n⚠️ Currently in streaming mode. Stop that first.");
-                        }
+                        });
                     }
                 } else if id == streaming_btn && streaming_enabled_input.load(Ordering::Relaxed) {
                     // Streaming Mode Logic
-                    let current_state = RecordingState::from(recording_state_main.load(Ordering::Relaxed));
-                    match current_state {
-                        RecordingState::Idle => {
-                            println!("\n🎤 Streaming mode started... (press Button {} again to stop)", streaming_btn);
-                            // Clear VAD and audio buffer
-                            if let Ok(mut v) = vad_main.lock() {
-                                v.clear();
+                    
+                    // Check if models are loaded checks
+                    let models_loaded = {
+                         recognizer_main.lock().unwrap().is_some()
+                    };
+                    
+                    if !models_loaded {
+                        println!("⚠️ Models not loaded. Press Button {} to load.", model_btn);
+                        overlay_main.show();
+                        overlay_main.set_text("Models Not Loaded!");
+                        thread::spawn({
+                            let ov = overlay_main.clone();
+                            move || {
+                                thread::sleep(Duration::from_secs(1));
+                                ov.hide();
                             }
-                            if let Ok(mut buf) = streaming_audio_main.lock() {
-                                buf.clear();
+                        });
+                    } else {
+                        let current_state = RecordingState::from(recording_state_main.load(Ordering::Relaxed));
+                        match current_state {
+                            RecordingState::Idle => {
+                                println!("\n🎤 Streaming mode started... (press Button {} again to stop)", streaming_btn);
+                                // Clear VAD and audio buffer
+                                if let Ok(mut v) = vad_main.lock() {
+                                    v.clear();
+                                }
+                                if let Ok(mut buf) = streaming_audio_main.lock() {
+                                    buf.clear();
+                                }
+                                // Show overlay
+                                overlay_main.show();
+                                overlay_main.set_text("Listening..."); // Reset text
+                                recording_state_main.store(RecordingState::StreamingRecording as u8, Ordering::Relaxed);
                             }
-                            // Show overlay
-                            overlay_main.show();
-                            recording_state_main.store(RecordingState::StreamingRecording as u8, Ordering::Relaxed);
-                        }
-                        RecordingState::StreamingRecording => {
-                            println!("\n⏹️ Stopping streaming...");
-                            recording_state_main.store(RecordingState::Idle as u8, Ordering::Relaxed);
-                            
-                            // Hide overlay
-                            overlay_main.hide();
-                            
-                            // Flush VAD to get any remaining speech
-                            if let Ok(mut v) = vad_main.lock() {
-                                v.flush();
-                            }
-                            // Wait for last transcriptions to come through
-                            thread::sleep(Duration::from_millis(400));
-                            
-                            // Get the accumulated audio
-                            let audio_samples = {
-                                let buf = streaming_audio_main.lock().unwrap();
-                                buf.clone()
-                            };
-                            
-                            if !audio_samples.is_empty() {
-                                println!("📝 Re-transcribing {} samples for proper punctuation...", audio_samples.len());
+                            RecordingState::StreamingRecording => {
+                                println!("\n⏹️ Stopping streaming...");
+                                recording_state_main.store(RecordingState::Idle as u8, Ordering::Relaxed);
                                 
-                                // Re-transcribe ALL audio at once (gives Parakeet full context)
-                                if let Ok(mut rec) = recognizer_main.lock() {
-                                    let result = rec.transcribe(16000, &audio_samples);
-                                    let final_text = result.text.trim();
+                                // Hide overlay
+                                overlay_main.hide();
+                                
+                                // Flush VAD to get any remaining speech
+                                if let Ok(mut v) = vad_main.lock() {
+                                    v.flush();
+                                }
+                                // Wait for last transcriptions to come through
+                                thread::sleep(Duration::from_millis(400));
+                                
+                                // Get the accumulated audio
+                                let audio_samples = {
+                                    let buf = streaming_audio_main.lock().unwrap();
+                                    buf.clone()
+                                };
+                                
+                                if !audio_samples.is_empty() {
+                                    println!("📝 Re-transcribing {} samples for proper punctuation...", audio_samples.len());
                                     
-                                    if !final_text.is_empty() {
-                                        println!("✨ Final: {}", final_text);
-                                        // Type the final, properly punctuated text
-                                        keyboard::paste_text(final_text);
+                                    // Re-transcribe ALL audio at once
+                                    if let Ok(mut rec_opt) = recognizer_main.lock() {
+                                        if let Some(rec) = rec_opt.as_mut() {
+                                            let result = rec.transcribe(16000, &audio_samples);
+                                            let final_text = result.text.trim();
+                                            
+                                            if !final_text.is_empty() {
+                                                println!("✨ Final: {}", final_text);
+                                                // Type the final, properly punctuated text
+                                                keyboard::paste_text(final_text);
+                                            }
+                                        }
                                     }
                                 }
+                                
+                                // Clear audio buffer
+                                if let Ok(mut buf) = streaming_audio_main.lock() {
+                                    buf.clear();
+                                }
+                                
+                                println!("✅ Streaming complete");
                             }
-                            
-                            // Clear audio buffer
-                            if let Ok(mut buf) = streaming_audio_main.lock() {
-                                buf.clear();
-                            }
-                            
-                            println!("✅ Streaming complete");
-                        }
-                        RecordingState::BatchRecording => {
-                            println!("\n⚠️ Currently in batch mode. Stop that first.");
+                             _ => {}
                         }
                     }
                 } else {
                     // Debug print for other buttons
-                     println!("🔍 Button pressed: {:?} (ID: {}) Name: {:?}", button, id, event.name);
+                     // println!("🔍 Button pressed: {:?} (ID: {}) Name: {:?}", button, id, event.name);
                 }
             } else {
-                 println!("🔍 Button pressed: {:?} Name: {:?}", button, event.name);
+                 // println!("🔍 Button pressed: {:?} Name: {:?}", button, event.name);
             }
         }
     }) {
@@ -389,4 +459,29 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Helper to show a message box for errors (Windows only)
+#[cfg(windows)]
+fn show_error_box(title: &str, message: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::winuser::{MessageBoxW, MB_OK, MB_ICONERROR};
+    
+    let wide_title: Vec<u16> = OsStr::new(title).encode_wide().chain(std::iter::once(0)).collect();
+    let wide_message: Vec<u16> = OsStr::new(message).encode_wide().chain(std::iter::once(0)).collect();
+    
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide_message.as_ptr(),
+            wide_title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_error_box(title: &str, message: &str) {
+    eprintln!("{}: {}", title, message);
 }
