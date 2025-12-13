@@ -2,6 +2,12 @@ use rdev::{simulate, EventType, Key};
 use std::{thread, time};
 use clipboard_win::{formats, set_clipboard};
 
+#[cfg(windows)]
+use winapi::um::winuser::{
+    SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_SHIFT, VK_MENU,
+};
+
 /// Normalize unicode punctuation to ASCII equivalents
 fn normalize_text(text: &str) -> String {
     text.chars().map(|c| match c {
@@ -24,8 +30,60 @@ fn normalize_text(text: &str) -> String {
     }).collect()
 }
 
-/// Paste text using clipboard (faster and more reliable than typing)
-/// Returns true if successful
+/// Force release all modifier keys to prevent stuck keys
+#[cfg(windows)]
+fn release_all_modifiers() {
+    unsafe {
+        // Check and release Ctrl keys
+        if GetAsyncKeyState(VK_LCONTROL) < 0 || GetAsyncKeyState(VK_RCONTROL) < 0 || GetAsyncKeyState(VK_CONTROL) < 0 {
+            // Create key-up events for both Ctrl keys
+            let mut inputs: [INPUT; 2] = std::mem::zeroed();
+            
+            inputs[0].type_ = INPUT_KEYBOARD;
+            *inputs[0].u.ki_mut() = KEYBDINPUT {
+                wVk: VK_LCONTROL as u16,
+                wScan: 0,
+                dwFlags: KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: 0,
+            };
+            
+            inputs[1].type_ = INPUT_KEYBOARD;
+            *inputs[1].u.ki_mut() = KEYBDINPUT {
+                wVk: VK_RCONTROL as u16,
+                wScan: 0,
+                dwFlags: KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: 0,
+            };
+            
+            SendInput(2, inputs.as_mut_ptr(), std::mem::size_of::<INPUT>() as i32);
+        }
+        
+        // Also release Shift and Alt if stuck
+        if GetAsyncKeyState(VK_SHIFT) < 0 {
+            let _ = simulate(&EventType::KeyRelease(Key::ShiftLeft));
+            let _ = simulate(&EventType::KeyRelease(Key::ShiftRight));
+        }
+        if GetAsyncKeyState(VK_MENU) < 0 {
+            let _ = simulate(&EventType::KeyRelease(Key::Alt));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn release_all_modifiers() {
+    // Fallback for non-Windows
+    let _ = simulate(&EventType::KeyRelease(Key::ControlLeft));
+    let _ = simulate(&EventType::KeyRelease(Key::ControlRight));
+    let _ = simulate(&EventType::KeyRelease(Key::ShiftLeft));
+    let _ = simulate(&EventType::KeyRelease(Key::ShiftRight));
+    let _ = simulate(&EventType::KeyRelease(Key::Alt));
+}
+
+/// Paste text using clipboard with Windows SendInput API
+/// This is more reliable than rdev::simulate and less likely to leave keys stuck
+#[cfg(windows)]
 pub fn paste_text(text: &str) -> bool {
     let normalized = normalize_text(text);
     
@@ -38,7 +96,82 @@ pub fn paste_text(text: &str) -> bool {
     // Small delay to ensure clipboard is set
     thread::sleep(time::Duration::from_millis(50));
     
-    // Send Ctrl+V to paste
+    // Use SendInput to send Ctrl+V as a single atomic operation
+    // This is more reliable than separate rdev::simulate calls
+    unsafe {
+        let mut inputs: [INPUT; 4] = std::mem::zeroed();
+        
+        // Ctrl down
+        inputs[0].type_ = INPUT_KEYBOARD;
+        *inputs[0].u.ki_mut() = KEYBDINPUT {
+            wVk: VK_LCONTROL as u16,
+            wScan: 0,
+            dwFlags: 0,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        
+        // V down
+        inputs[1].type_ = INPUT_KEYBOARD;
+        *inputs[1].u.ki_mut() = KEYBDINPUT {
+            wVk: 0x56, // VK_V
+            wScan: 0,
+            dwFlags: 0,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        
+        // V up
+        inputs[2].type_ = INPUT_KEYBOARD;
+        *inputs[2].u.ki_mut() = KEYBDINPUT {
+            wVk: 0x56, // VK_V
+            wScan: 0,
+            dwFlags: KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        
+        // Ctrl up
+        inputs[3].type_ = INPUT_KEYBOARD;
+        *inputs[3].u.ki_mut() = KEYBDINPUT {
+            wVk: VK_LCONTROL as u16,
+            wScan: 0,
+            dwFlags: KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        
+        // Send all 4 inputs as a single atomic transaction
+        let sent = SendInput(4, inputs.as_mut_ptr(), std::mem::size_of::<INPUT>() as i32);
+        
+        if sent != 4 {
+            eprintln!("SendInput failed, only sent {} of 4 events", sent);
+        }
+    }
+    
+    // Small delay after paste
+    thread::sleep(time::Duration::from_millis(50));
+    
+    // CRITICAL: Force release all modifiers to prevent stuck keys
+    // This fixes the issue where Ctrl stays "down" and subsequent clicks
+    // are treated as Ctrl+clicks (multi-select behavior)
+    release_all_modifiers();
+    
+    true
+}
+
+/// Fallback paste implementation for non-Windows platforms
+#[cfg(not(windows))]
+pub fn paste_text(text: &str) -> bool {
+    let normalized = normalize_text(text);
+    
+    if set_clipboard(formats::Unicode, &normalized).is_err() {
+        eprintln!("Failed to set clipboard");
+        return false;
+    }
+    
+    thread::sleep(time::Duration::from_millis(50));
+    
     let _ = simulate(&EventType::KeyPress(Key::ControlLeft));
     thread::sleep(time::Duration::from_millis(10));
     let _ = simulate(&EventType::KeyPress(Key::KeyV));
@@ -46,8 +179,9 @@ pub fn paste_text(text: &str) -> bool {
     thread::sleep(time::Duration::from_millis(10));
     let _ = simulate(&EventType::KeyRelease(Key::ControlLeft));
     
-    // Small delay after paste
     thread::sleep(time::Duration::from_millis(50));
+    
+    release_all_modifiers();
     
     true
 }

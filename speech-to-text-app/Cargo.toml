@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 cpal = "0.16"
-rdev = "0.5"
+rdev = { version = "0.5", features = ["unstable_grab"] }
 sherpa-rs = { path = "../sherpa-rs/crates/sherpa-rs", features = ["download-binaries"] }
 hound = "3.5"
 tray-icon = "0.19"

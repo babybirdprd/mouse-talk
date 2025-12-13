@@ -9,7 +9,7 @@ mod tray;
 use anyhow::Result;
 use clap::Parser;
 use muda::MenuEvent;
-use rdev::{listen, Button, EventType};
+use rdev::{grab, Button, Event, EventType};
 use sherpa_rs::nemo_ctc::{NemoCtcConfig, NemoCtcRecognizer};
 use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -283,12 +283,34 @@ fn main() -> Result<()> {
     let streaming_enabled_input = streaming_enabled.clone();
     let model_btn_enabled_input = batch_enabled.clone(); // Reusing batch toggle for model toggle
 
-    // Start input listener in separate thread
+    // Start input grabber in separate thread
+    // Using grab instead of listen allows us to CONSUME button events
+    // so they don't trigger browser back/forward or other app hotkeys
     thread::spawn(move || {
-        if let Err(error) = listen(move |event| {
-        // Simplify matching
+        if let Err(error) = grab(move |event: Event| -> Option<Event> {
+        // Check if this is a button event we want to handle
+        let should_consume = match event.event_type {
+            EventType::ButtonPress(button) | EventType::ButtonRelease(button) => {
+                // Get button ID
+                let btn_id = match button {
+                    Button::Unknown(b) => Some(b),
+                    Button::Left => None, 
+                    Button::Right => None,
+                    Button::Middle => Some(3),
+                };
+                
+                // Check if this is one of our configured buttons
+                if let Some(id) = btn_id {
+                    id == model_btn || id == streaming_btn
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        
+        // Handle button press events (but not release)
         if let EventType::ButtonPress(button) = event.event_type {
-            // Normalize button to u8 if possible for comparison
             let btn_id = match button {
                 Button::Unknown(b) => Some(b),
                 Button::Left => None, 
@@ -426,13 +448,16 @@ fn main() -> Result<()> {
                         }
                          _ => {}
                     }
-                } else {
-                    // Debug print for other buttons
-                     // println!("🔍 Button pressed: {:?} (ID: {}) Name: {:?}", button, id, event.name);
                 }
-            } else {
-                 // println!("🔍 Button pressed: {:?} Name: {:?}", button, event.name);
             }
+        }
+        
+        // Return None to consume the event (block it from reaching other apps)
+        // Return Some(event) to pass it through
+        if should_consume {
+            None // Block this button from triggering browser back/forward etc.
+        } else {
+            Some(event) // Pass through all other events
         }
     }) {
             eprintln!("Error: {:?}", error);
